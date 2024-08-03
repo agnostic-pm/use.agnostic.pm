@@ -1,4 +1,4 @@
-;(require"http".request"//use.agnostic.pm"|>load)()
+;(require"http".request"//plutolang.github.io/apm/full"|>load)()
 
 git "https://github.com/PlutoLang/gitwit"
 	from "gitwit.pluto" to "gitwit.pluto"

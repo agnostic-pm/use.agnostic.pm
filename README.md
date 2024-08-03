@@ -3,13 +3,13 @@
 > [!WARNING]
 > APM currently depends on Pluto 0.10.0, which is still in development.
 
-APM uses [Pluto](https://pluto-lang.org/) (a fork of Lua) as the configuration format.
+APM uses [Pluto](https://plutolang.github.io/) (a fork of Lua) as the configuration format.
 
-1. Be sure to [install Pluto](https://pluto-lang.org/docs/Getting%20Started), if you haven't already.
+1. Be sure to [install Pluto](https://plutolang.github.io/docs/Getting%20Started), if you haven't already.
 2. Create a `deps.pluto` file in your project.
 3. Insert the following:
 ```elixir
-;(require"http".request"//use.agnostic.pm"|>load)()
+;(require"http".request"//plutolang.github.io/apm/full"|>load)()
 ```
 
 Now you can describe your dependencies, which can be as simple as this:
@@ -26,4 +26,4 @@ git "https://github.com/omni-wf/warframe-public-export-plus"
     from "*.json" to "data/*.json"
 ```
 
-To install and update your dependencies, simply run the `deps.pluto` script, which can be done by entering `pluto deps.pluto` into a command prompt, or [using the build system editor integration](https://pluto-lang.org/docs/Editor%20Integration), if supported.
+To install and update your dependencies, simply run the `deps.pluto` script, which can be done by entering `pluto deps.pluto` into a command prompt, or [using the build system editor integration](https://plutolang.github.io/docs/Editor%20Integration), if supported.
