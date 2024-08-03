@@ -26,4 +26,4 @@ git "https://github.com/omni-wf/warframe-public-export-plus"
     from "*.json" to "data/*.json"
 ```
 
-To install and update your dependencies, simply run the `deps.pluto` script, which can be done by entering `pluto deps.pluto` into a command prompt, or [using the build system editor integration](https://pluto-lang.org/docs/Editor%20Integration), if supported.
+To install and update your dependencies, simply run the `deps.pluto` script, which can be done by entering `pluto deps.pluto` into a command prompt, or [using the build system editor integration](https://plutolang.github.io/docs/Editor%20Integration), if supported.
