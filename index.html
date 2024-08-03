@@ -1,0 +1,656 @@
+package.preload["gitwit"] = function()
+	local crypto = require "pluto:crypto"
+local http = require "pluto:http"
+local socket = require "pluto:socket"
+local url = require "pluto:url"
+
+local gitwit = {}
+
+-- returns a table like: { ["HEAD"] = "<sha1 hash>", ["refs/heads/senpai"] = "<sha1 hash>", ["refs/tags/0.1.0"] = "<sha1 hash>" }
+function gitwit.fetchrefs(url_base)
+    return gitwit.parserefs(gitwit.downloadrefs(url_base))
+end
+
+function gitwit.downloadrefs(url_base)
+    return http.request(url_base.."/info/refs?service=git-upload-pack")
+end
+
+function gitwit.parserefs(data)
+    local i = 1
+    local unpacked = ""
+    while i < #data do
+        local chunk_size = tonumber(data:sub(i, i + 3), 16)
+        if chunk_size < 4 then
+            chunk_size = 4
+        end
+        unpacked ..= data:sub(i + 4, i + chunk_size - 1)
+        i += chunk_size
+    end
+    local refs = {}
+    for unpacked:split("\n") as line do
+        if #line ~= 0 and line[1] ~= "#" then
+            local [hash, ref] = line:split("\0")[1]:split(" ")
+            refs[ref] = hash
+        end
+    end
+    return refs
+end
+
+function gitwit.fetchpackfile(url_base, commit_hash, base_objects: ?table)
+    return gitwit.parsepackfile(gitwit.downloadpackfile(url_base, commit_hash, base_objects), base_objects)
+end
+
+local function downloadpackfileaux(url_base, body)
+    local { host, path } = url.parse(url_base.."/git-upload-pack")
+    local s = socket.connect(host, 443)
+    assert(s, "failed to connect to "..host)
+    assert(s:starttls(host), "failed to establish a secure tunnel to "..host)
+    s:send("POST "..path.." HTTP/1.0\r\n"
+        .. "Host: "..host.."\r\n"
+        .. "User-Agent: PlutoLang/gitwit\r\n"
+        .. "Git-Protocol: version=2\r\n"
+        .. "Content-Type: application/x-git-upload-pack-request\r\n"
+        .. "Content-Length: "..#body.."\r\n"
+        .. "\r\n"
+        .. body
+        )
+    -- Now we gotta parse this shit: https://git-scm.com/docs/gitprotocol-v2
+    -- I don't wanna handle a pkt-line possibly being sent over multiple TLS records, so we're buffering it first.
+    local data = ""
+    while chunk := s:recv() do
+        data ..= chunk
+    end
+    data = data:sub(data:find("\r\n\r\n") + 4)
+    local i = 1
+    local packfile = ""
+    while true do
+        local chunk_size = tonumber(data:sub(i, i + 3), 16)
+        --print(chunk_size)
+        --if data:sub(i + 4, i + 4) == "\2" then
+            --print(data:sub(i + 5, i + chunk_size - 1))
+        --end
+        if data:sub(i + 4, i + 4) == "\1" then
+            packfile ..= data:sub(i + 5, i + chunk_size - 1)
+        end
+        if chunk_size == 0 then
+            break
+        end
+        i += chunk_size
+    end
+    return packfile
+end
+
+function gitwit.downloadpackfile(url_base, commit_hash, base_objects: ?table)
+    if commit_hash == nil then
+        commit_hash = gitwit.fetchrefs(url_base).HEAD
+    end
+    assert(#commit_hash == 40)
+    -- This is based on what my client sent with 'git clone --no-checkout --depth=1'. I think the duplicated request is a quirk of protocol version 2.
+    local request = "0032want "..commit_hash.."\n"
+    if base_objects then
+        local have = {}
+        for base_objects as object do
+            if object.type == "commit" then
+                have:insert(object.hash)
+            end
+        end
+        for have as hash do
+            request ..= "0032have "..hash.."\n"
+        end
+        for have as hash do
+            request ..= "0035shallow "..hash.."\n"
+        end
+    end
+    local body = "0011command=fetch001eagent=git/2.40.0.windows.10016object-format=sha10001000dthin-pack000finclude-tag000dofs-delta000cdeepen 1"..request..request
+            .. "0009done\n"
+            .. "0000"
+    return downloadpackfileaux(url_base, body)
+end
+
+function gitwit.downloadfullpackfile(url_base, commit_hash)
+    if commit_hash == nil then
+        commit_hash = gitwit.fetchrefs(url_base).HEAD
+    end
+    assert(#commit_hash == 40)
+    local body = "0011command=fetch001eagent=git/2.40.0.windows.10016object-format=sha10001000dthin-pack000finclude-tag000dofs-delta0032want "..commit_hash.."\n"
+            .. "0032want "..commit_hash.."\n"
+            .. "0009done\n"
+            .. "0000"
+    return downloadpackfileaux(url_base, body)
+end
+
+-- https://git-scm.com/docs/gitformat-pack
+-- https://github.com/robisonsantos/packfile_reader
+local typenames <const> = { "commit", "tree", "blob", "tag" }
+function gitwit.parsepackfile(packfile, base_objects)
+    local objects = {}
+    assert(packfile:sub(1, 4) == "PACK")
+    assert(string.unpack(">I4", packfile, 5) == 2)
+    local num_objects = string.unpack(">I4", packfile, 9)
+    local i = 13
+    for obj = 1, num_objects do
+        local obj_offset = i
+        local byte = packfile:byte(i)
+        i += 1
+        local type = (byte >> 4) & 0b111
+        assert(type ~= 0)
+
+        local length = byte & 0b1111
+        local has_more = (byte >> 7) ~= 0
+        local shift = 4
+        while has_more do
+            byte = packfile:byte(i)
+            i += 1
+            length |= (byte & 0b1111111) << shift
+            shift += 7
+            has_more = (byte >> 7) ~= 0
+        end
+
+        local base
+        if type == 6 then
+            -- OBJ_OFS_DELTA, has an offset before the compressed data
+            -- https://github.com/git/git/blob/26e47e261e969491ad4e3b6c298450c061749c9e/builtin/pack-objects.c#L1443-L1473
+            byte = packfile:byte(i)
+            i += 1
+            local offset = (byte & 0b1111111)
+            has_more = (byte >> 7) ~= 0
+            while has_more do
+                byte = packfile:byte(i)
+                i += 1
+                offset += 1
+                offset = (offset << 7) + (byte & 0b1111111)
+                has_more = (byte >> 7) ~= 0
+            end
+            offset = (obj_offset - offset)
+            base = objects:find(|x| -> x.offset == offset)
+        elseif type == 7 then
+            -- OBJ_REF_DELTA, has an object hash before the compressed data
+            if base_objects then
+                local base_hash = packfile:sub(i, i + 19):split(""):map(|x| -> string.format("%02x", x:byte())):concat("")
+                base = base_objects:find(|x| -> x.hash == base_hash)
+            end
+            i += 20
+        end
+
+        local decompressed, info = crypto.deflate(packfile:sub(i), length)
+
+        if type == 6 or type == 7 then
+            type = base.typeid
+            local data = {}
+            local j = 1
+
+            -- skip size of base object
+            while (decompressed:byte(j) >> 7) ~= 0 do
+                j += 1
+            end
+            j += 1
+
+            -- skip size of undeltified object
+            while (decompressed:byte(j) >> 7) ~= 0 do
+                j += 1
+            end
+            j += 1
+
+            while j < #decompressed do
+                local insn = decompressed:byte(j)
+                j += 1
+                if (insn >> 7) == 0 then
+                    -- Add new data
+                    data:insert(decompressed:sub(j, j + insn - 1))
+                    j += insn
+                else
+                    -- Copy from base object
+                    local cp_offset = 0
+                    local cp_size = 0
+                    if (insn & 1) ~= 0 then
+                        cp_offset |= decompressed:byte(j)
+                        j += 1
+                    end
+                    if ((insn >> 1) & 1) ~= 0 then
+                        cp_offset |= decompressed:byte(j) << 8
+                        j += 1
+                    end
+                    if ((insn >> 2) & 1) ~= 0 then
+                        cp_offset |= decompressed:byte(j) << 16
+                        j += 1
+                    end
+                    if ((insn >> 3) & 1) ~= 0 then
+                        cp_offset |= decompressed:byte(j) << 24
+                        j += 1
+                    end
+                    if ((insn >> 4) & 1) ~= 0 then
+                        cp_size |= decompressed:byte(j)
+                        j += 1
+                    end
+                    if ((insn >> 5) & 1) ~= 0 then
+                        cp_size |= decompressed:byte(j) << 8
+                        j += 1
+                    end
+                    if ((insn >> 6) & 1) ~= 0 then
+                        cp_size |= decompressed:byte(j) << 16
+                        j += 1
+                    end
+                    if cp_size == 0 then
+                        cp_size = 0x10000
+                    end
+                    cp_offset += 1
+                    data:insert(base.raw_data:sub(cp_offset, cp_offset + cp_size - 1))
+                end
+            end
+            decompressed = data:concat("")
+        end
+
+        if type <= #typenames then
+            local data = decompressed
+            if type == 1 then
+                data = gitwit.parsecommit(data)
+            elseif type == 2 then
+                data = gitwit.parsetree(data)
+            end
+            objects:insert({
+                typeid = type,
+                type = typenames[type],
+                data = data,
+                raw_data = decompressed,
+                hash = crypto.sha1(typenames[type].." "..#decompressed.."\0"..decompressed),
+                compressed_data = packfile:sub(i, i + info.compressed_size - 1),
+                compressed_base = base?.hash,
+                compressed_length = length,
+                offset = obj_offset,
+            })
+        end
+
+        i += info.compressed_size
+    end
+    --print(crypto.sha1(packfile:sub(1, i - 1)))
+    --print(packfile:sub(i):split(""):map(|x| -> string.format("%02x", x:byte())):concat(""))
+    return objects
+end
+
+function gitwit.blobhash(data)
+    return crypto.sha1("blob "..#data.."\0"..data)
+end
+
+function gitwit.parsecommit(data)
+    local sep = data:find("\n\n")
+    local commit = {
+        message = data:sub(sep + 2):rstrip("\n")
+    }
+    for data:sub(1, sep - 1):split("\n") as line do
+        sep = line:find(" ")
+        commit[line:sub(1, sep - 1)] = line:sub(sep + 1)
+    end
+    return commit
+end
+
+function gitwit.parsetree(data)
+    local files = {}
+    local i = 1
+    while i < #data do
+        local mode = {}
+        local name = {}
+        while i < #data and data[i] ~= " " do
+            mode:insert(data[i])
+            i += 1
+        end
+        i += 1
+        while i < #data and data[i] ~= "\0" do
+            name:insert(data[i])
+            i += 1
+        end
+        i += 1
+        local hash = data:sub(i, i + 19):split(""):map(|x| -> string.format("%02x", x:byte())):concat("")
+        i += 20
+        files:insert({
+            mode = mode:concat(""),
+            name = name:concat(""),
+            hash = hash,
+        })
+    end
+    return files
+end
+
+function gitwit.listallfiles(objects, root_tree)
+    local files = {}
+    gitwit.listallfilesaux(objects, files, "", root_tree)
+    return files
+end
+
+function gitwit.listallfilesaux(objects, files, prefix, tree)
+    for tree.data as file do
+        if file.mode == "40000" then
+            local data = objects:find(|x| -> x.hash == file.hash)
+            assert(data)
+            gitwit.listallfilesaux(objects, files, prefix .. file.name .. "/", data)
+        else
+            files:insert({
+                mode = file.mode,
+                name = file.name,
+                path = prefix .. file.name,
+                hash = file.hash,
+            })
+        end
+    end
+end
+
+function gitwit.createpackfile(objects)
+    local data = { "PACK", string.pack(">I4I4", 2, #objects) }
+    local offset = 12
+    local offsets = {}
+    for objects as object do
+        local typeid = object.typeid
+        local base_in_packfile = false
+        if object.compressed_base then
+            base_in_packfile = offsets[object.compressed_base]
+            if base_in_packfile then
+                typeid = 6
+            else
+                typeid = 7
+            end
+        end
+        offsets[object.hash] = offset
+
+        local length = object.compressed_length or #object.raw_data
+        local byte = length & 0b1111
+        length >>= 4
+        byte |= (typeid << 4)
+        if length ~= 0 then
+            byte |= 0x80
+        end
+        data:insert(string.char(byte)) offset += 1
+        while length ~= 0 do
+            byte = length & 0x7f
+            length >>= 7
+            if length ~= 0 then
+                byte |= 0x80
+            end
+            data:insert(string.char(byte)) offset += 1
+        end
+
+        if object.compressed_data then
+            if object.compressed_base then
+                if base_in_packfile then
+                    -- https://github.com/git/git/blob/26e47e261e969491ad4e3b6c298450c061749c9e/builtin/pack-objects.c#L409-L419
+                    local delta = offsets[object.hash] - offsets[object.compressed_base]
+                    local bytes = { delta & 0x7f }
+                    delta >>= 7
+                    while delta ~= 0 do
+                        delta -= 1
+                        bytes:insert(0x80 | (delta & 0x7f))
+                        delta >>= 7
+                    end
+                    for i = #bytes, 1, -1 do
+                        data:insert(string.char(bytes[i])) offset += 1
+                    end
+                else
+                    data:insert((object.compressed_base:gsub("..", |x| -> string.char(tonumber(x, 16))))) offset += 20
+                end
+            end
+            data:insert(object.compressed_data) offset += #object.compressed_data
+        else
+            length = #object.raw_data
+            local i = 1
+            while length >= 0xffff do
+                data:insert(string.pack("<I1I2I2", 0, 0xffff, 0)) offset += 5
+                data:insert(object.raw_data:sub(i, i + 0xfffe)) offset += 0xffff
+                i += 0xffff
+                length -= 0xffff
+            end
+            data:insert(string.pack("<I1I2I2", 1, length, length ~ 0xffff)) offset += 5
+            data:insert(object.raw_data:sub(i)) offset += length
+        end
+    end
+    data = data:concat("")
+    data ..= crypto.sha1(data, true)
+    return data
+end
+
+return gitwit
+end
+if not compareversions or compareversions(_PVERSION:sub(7), "0.10.0") < 0 then
+	error("APM requires Pluto 0.10.0 or higher") -- because gitwit requires crypto.deflate
+end
+
+local crypto = require "pluto:crypto"
+local gitwit = require "gitwit"
+
+local packages = {}
+
+git = function(remote_url)
+	packages:insert({
+		url = remote_url,
+		files = {},
+	})
+end
+
+local last_from
+from = function(path)
+	last_from = path
+end
+to = function(path)
+	assert(last_from, "'to' must be preceeded by 'from'")
+	packages[#packages].files:insert({
+		from = last_from,
+		to = path
+	})
+	last_from = nil
+end
+
+version = function(version)
+	packages[#packages].version = version
+end
+
+local function countstr(i, singular, plural)
+	if i == 1 then
+		return "1 "..singular
+	end
+	return i.." "..plural
+end
+
+local function version_matches_constraints(constraints, version)
+    for constraints as constraint do
+        if constraint[1] == "^" then
+            if compareversions(version, constraint:sub(2)) < 0 then
+                return false
+            end
+            local [major, minor] = constraint:sub(2):split("."):map(tonumber)
+            minor ??= 0
+            if major == 0 then
+                if compareversions(version, $"0.{minor + 1}") >= 0 then
+                    return false
+                end
+            else
+                if compareversions(version, major + 1) >= 0 then
+                    return false
+                end
+            end
+        elseif constraint[1] == "~" then
+            if compareversions(version, constraint:sub(2)) < 0 then
+                return false
+            end
+            local [major, minor] = constraint:sub(2):split("."):map(tonumber)
+            minor ??= 0
+            if compareversions(version, $"{major}.{minor + 1}") >= 0 then
+                return false
+            end
+        elseif constraint[1] == ">" then
+            if constraint[2] == "=" then
+                if compareversions(version, constraint:sub(3)) < 0 then
+                    return false
+                end
+            else
+                if compareversions(version, constraint:sub(2)) <= 0 then
+                    return false
+                end
+            end
+        elseif constraint[1] == "<" then
+            if constraint[2] == "=" then
+                if compareversions(version, constraint:sub(3)) > 0 then
+                    return false
+                end
+            else
+                if compareversions(version, constraint:sub(2)) >= 0 then
+                    return false
+                end
+            end
+        else
+            if version ~= constraint then
+                return false
+            end
+        end
+    end
+    return true
+end
+local function get_highest_matching_version(filter, versions)
+    local constraints = filter:split(" ")
+    local highest_matching
+    for versions as version do
+        if version_matches_constraints(constraints, version) then
+            if not highest_matching or compareversions(version, highest_matching) > 0 then
+                highest_matching = version
+            end
+        end
+    end
+    return highest_matching
+end
+assert(get_highest_matching_version("^1.0", { "1.0.0" }) == "1.0.0")
+assert(get_highest_matching_version("^1.0", { "1.0.0", "1.0.1" }) == "1.0.1")
+assert(get_highest_matching_version("^1.0", { "1.0.0", "1.0.1", "1.1" }) == "1.1")
+assert(get_highest_matching_version("~1.0", { "1.0.0", "1.0.1", "1.1" }) == "1.0.1")
+assert(get_highest_matching_version(">=1.0 <1.1", { "1.0.0", "1.0.1", "1.1" }) == "1.0.1")
+
+local function matchfile(pattern, name)
+    pattern = pattern:gsub("%.", "%%."):gsub("%*", "(.+)")
+    local t = table.pack(string.find(name, pattern))
+    if t[1] then
+        t.n = nil
+        t:remove(1)
+        t:remove(1)
+        return t
+    end
+    return nil
+end
+
+__apm_atexit = setmetatable({}, {
+	__gc = function()
+		if #packages == 0 then
+			print([[Welcome to APM! Configure your project's dependencies like so:]].."\n"
+				..[[]].."\n"
+				..[[git "https://github.com/PlutoLang/pluto-websocket"]].."\n"
+				..[[    from "websocket.pluto" to "lib/websocket.pluto"]].."\n"
+				..[[]].."\n"
+				..[[git "https://github.com/omni-wf/warframe-public-export-plus"]].."\n"
+				..[[    version "^0.4"]].."\n"
+				..[[    from "*.json" to "data/*.json"]].."\n"
+				)
+			return
+		end
+
+		print("Fetching versions for "..countstr(#packages, "package", "packages").."...")
+		for packages as pkg do
+			local refs = gitwit.fetchrefs(pkg.url)
+			pkg.desired_version = "HEAD"
+			pkg.desired_commit_hash = refs.HEAD
+			if pkg.version then
+				local versions = {}
+				local version_map = {}
+				for ref, hash in refs do
+					if ref:sub(1, 10) == "refs/tags/" then
+						local tag = ref:sub(11)
+						if tag[1] == "v" then
+							tag = tag:sub(2)
+						end
+						versions:insert(tag)
+						version_map[tag] = hash
+					end
+				end
+				if version := get_highest_matching_version(pkg.version, versions) then
+					pkg.desired_version = version
+					pkg.desired_commit_hash = version_map[version]
+				else
+					print(pkg.url.." has no version matching '"..pkg.version.."'")
+				end
+			end
+		end
+
+		if not io.exists(".apm_cache") then
+			io.makedir(".apm_cache")
+		end
+
+		-- Ensure up-to-date packfiles for all packages
+		local num_up2date = 0
+		local num_updated = 0
+		for packages as pkg do
+			local arr = pkg.url:split("/")
+			local packfile_path = ".apm_cache/"..arr[#arr].."."..string.format("%08x", crypto.joaat(pkg.url))..".pack" -- including url hash just in case package name is not unique
+			if io.exists(packfile_path) then
+				pkg.objects = gitwit.parsepackfile(io.contents(packfile_path))
+			else
+				pkg.objects = {}
+			end
+			if not pkg.objects:find(|x| -> x.hash == pkg.desired_commit_hash) then
+				num_updated += 1
+				print("Downloading "..pkg.url.." (at "..pkg.desired_version..")...")
+				local packfile = gitwit.downloadpackfile(pkg.url, pkg.desired_commit_hash, pkg.objects)
+				for gitwit.parsepackfile(packfile, pkg.objects) as new_obj do
+					pkg.objects:insert(new_obj)
+				end
+				io.contents(packfile_path, gitwit.createpackfile(pkg.objects))
+				pkg.updated = true
+			else
+				num_up2date += 1
+			end
+		end
+		print(countstr(num_updated, "package", "packages").." downloaded; "..countstr(num_up2date, "was", "were").." up-to-date in cache.")
+
+		-- Ensure local files are present as desired.
+		local num_created = 0
+		local num_repaired = 0
+		local num_updated_files = 0
+		local num_files = 0
+		for packages as pkg do
+			local commit = pkg.objects:find(|x| -> x.hash == pkg.desired_commit_hash)
+			local tree = pkg.objects:find(|x| -> x.hash == commit.data.tree)
+			local remote_files = gitwit.listallfiles(pkg.objects, tree)
+			for pkg.files as file do
+				local any_matches = false
+				for remote_files as file_entry do
+					if substitutions := matchfile(file.from, file_entry.path) then
+						any_matches = true
+						num_files += 1
+						local to = file.to
+						for i = 1, #substitutions do
+							to = to:replace("*", substitutions[i])
+						end
+						local need_to_fetch = true
+						if io.exists(to) then
+							if gitwit.blobhash(io.contents(to) or "") == file_entry.hash then
+								need_to_fetch = false
+							else
+								if pkg.updated then
+									num_updated_files += 1
+								else
+									num_repaired += 1
+								end
+							end
+						else
+							num_created += 1
+						end
+						if need_to_fetch then
+							local object = pkg.objects:find(|x| -> x.hash == file_entry.hash)
+							local parent = io.part(to, "parent")
+							if parent ~= "" then
+								io.makedirs(parent)
+							end
+							io.contents(to, object.data)
+						end
+					end
+				end
+				if not any_matches then
+					print("Failed to find any file matching '"..file.from.."' in package.")
+				end
+			end
+		end
+		print("Processed "..countstr(num_files, "file", "files")..": "..num_created.." created, "..num_updated_files.." updated, "..num_repaired.." repaired.")
+	end
+})
